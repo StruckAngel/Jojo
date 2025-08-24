@@ -1,0 +1,317 @@
+# EPIC Fullscreen Auto-Restore Monitor
+# Monitors Citrix EPIC application and automatically restores fullscreen mode
+# when it's accidentally exited across dual TV displays
+
+param(
+    [int]$CheckInterval = 5,           # Check every 5 seconds
+    [string]$ProcessFilter = "*citrix*", # Filter for Citrix processes
+    [switch]$Verbose,                  # Enable verbose logging
+    [switch]$LogToFile                 # Log to file instead of console
+)
+
+# Set up logging
+$LogPath = "$env:TEMP\EPICFullscreenMonitor.log"
+function Write-Log {
+    param($Message, $Level = "INFO")
+    $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    $logEntry = "[$timestamp] [$Level] $Message"
+    
+    if ($LogToFile) {
+        Add-Content -Path $LogPath -Value $logEntry
+    }
+    if ($Verbose -or $Level -eq "ERROR") {
+        Write-Host $logEntry -ForegroundColor $(
+            switch($Level) {
+                "ERROR" { "Red" }
+                "WARN"  { "Yellow" }
+                "INFO"  { "Green" }
+                default { "White" }
+            }
+        )
+    }
+}
+
+# Windows API definitions for window management
+Add-Type @"
+using System;
+using System.Runtime.InteropServices;
+using System.Text;
+
+public class WindowAPI {
+    [DllImport("user32.dll")]
+    public static extern IntPtr GetForegroundWindow();
+    
+    [DllImport("user32.dll")]
+    public static extern bool GetWindowPlacement(IntPtr hWnd, ref WINDOWPLACEMENT lpwndpl);
+    
+    [DllImport("user32.dll")]
+    public static extern bool GetWindowRect(IntPtr hWnd, out RECT lpRect);
+    
+    [DllImport("user32.dll")]
+    public static extern bool IsZoomed(IntPtr hWnd);
+    
+    [DllImport("user32.dll")]
+    public static extern int GetWindowText(IntPtr hWnd, StringBuilder lpString, int nMaxCount);
+    
+    [DllImport("user32.dll")]
+    public static extern int GetWindowTextLength(IntPtr hWnd);
+    
+    [DllImport("user32.dll")]
+    public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint lpdwProcessId);
+    
+    [DllImport("user32.dll")]
+    public static extern bool SetForegroundWindow(IntPtr hWnd);
+    
+    [DllImport("user32.dll")]
+    public static extern int GetSystemMetrics(int nIndex);
+    
+    // System metrics constants
+    public const int SM_CXSCREEN = 0;
+    public const int SM_CYSCREEN = 1;
+    public const int SM_CXVIRTUALSCREEN = 78;
+    public const int SM_CYVIRTUALSCREEN = 79;
+}
+
+[StructLayout(LayoutKind.Sequential)]
+public struct WINDOWPLACEMENT {
+    public int length;
+    public int flags;
+    public int showCmd;
+    public System.Drawing.Point ptMinPosition;
+    public System.Drawing.Point ptMaxPosition;
+    public System.Drawing.Rectangle rcNormalPosition;
+}
+
+[StructLayout(LayoutKind.Sequential)]
+public struct RECT {
+    public int Left;
+    public int Top;
+    public int Right;
+    public int Bottom;
+}
+
+public static class ShowWindowCommands {
+    public const int SW_HIDE = 0;
+    public const int SW_SHOWNORMAL = 1;
+    public const int SW_SHOWMINIMIZED = 2;
+    public const int SW_SHOWMAXIMIZED = 3;
+    public const int SW_SHOWNOACTIVATE = 4;
+    public const int SW_SHOW = 5;
+    public const int SW_MINIMIZE = 6;
+    public const int SW_SHOWMINNOACTIVE = 7;
+    public const int SW_SHOWNA = 8;
+    public const int SW_RESTORE = 9;
+}
+"@
+
+# Load Windows Forms for sending keystrokes
+Add-Type -AssemblyName System.Windows.Forms
+
+function Get-WindowTitle {
+    param([IntPtr]$WindowHandle)
+    
+    try {
+        $length = [WindowAPI]::GetWindowTextLength($WindowHandle)
+        if ($length -eq 0) { return "" }
+        
+        $sb = New-Object System.Text.StringBuilder ($length + 1)
+        [WindowAPI]::GetWindowText($WindowHandle, $sb, $sb.Capacity) | Out-Null
+        return $sb.ToString()
+    }
+    catch {
+        return ""
+    }
+}
+
+function Get-ProcessByWindowHandle {
+    param([IntPtr]$WindowHandle)
+    
+    try {
+        $processId = 0
+        [WindowAPI]::GetWindowThreadProcessId($WindowHandle, [ref]$processId) | Out-Null
+        if ($processId -ne 0) {
+            return Get-Process -Id $processId -ErrorAction SilentlyContinue
+        }
+    }
+    catch {
+        return $null
+    }
+    return $null
+}
+
+function Test-WindowFullscreen {
+    param([IntPtr]$WindowHandle)
+    
+    try {
+        # Get window rectangle
+        $rect = New-Object RECT
+        [WindowAPI]::GetWindowRect($WindowHandle, [ref]$rect) | Out-Null
+        
+        # Get screen dimensions (including all monitors)
+        $screenWidth = [WindowAPI]::GetSystemMetrics([WindowAPI]::SM_CXVIRTUALSCREEN)
+        $screenHeight = [WindowAPI]::GetSystemMetrics([WindowAPI]::SM_CYVIRTUALSCREEN)
+        
+        # Calculate window dimensions
+        $windowWidth = $rect.Right - $rect.Left
+        $windowHeight = $rect.Bottom - $rect.Top
+        
+        # Get window placement to check if it's maximized
+        $placement = New-Object WINDOWPLACEMENT
+        $placement.length = [System.Runtime.InteropServices.Marshal]::SizeOf($placement)
+        [WindowAPI]::GetWindowPlacement($WindowHandle, [ref]$placement) | Out-Null
+        
+        # True fullscreen typically covers the entire virtual desktop
+        # and is not just "maximized" in the Windows sense
+        $coversScreen = ($windowWidth -ge $screenWidth * 0.95) -and ($windowHeight -ge $screenHeight * 0.95)
+        $isMaximized = $placement.showCmd -eq [ShowWindowCommands]::SW_SHOWMAXIMIZED
+        
+        # For dual monitor setups, we want to detect if it spans both screens
+        $spansMultipleMonitors = $windowWidth -gt [WindowAPI]::GetSystemMetrics([WindowAPI]::SM_CXSCREEN)
+        
+        Write-Log "Window: ${windowWidth}x${windowHeight}, Screen: ${screenWidth}x${screenHeight}, Maximized: $isMaximized, Spans: $spansMultipleMonitors" "INFO"
+        
+        return @{
+            IsFullscreen = $coversScreen -and (-not $isMaximized -or $spansMultipleMonitors)
+            IsMaximized = $isMaximized
+            WindowWidth = $windowWidth
+            WindowHeight = $windowHeight
+            SpansMonitors = $spansMultipleMonitors
+        }
+    }
+    catch {
+        Write-Log "Error checking fullscreen state: $($_.Exception.Message)" "ERROR"
+        return @{
+            IsFullscreen = $false
+            IsMaximized = $false
+            WindowWidth = 0
+            WindowHeight = 0
+            SpansMonitors = $false
+        }
+    }
+}
+
+function Send-FullscreenToggle {
+    param([IntPtr]$WindowHandle)
+    
+    try {
+        # Make sure the window has focus
+        [WindowAPI]::SetForegroundWindow($WindowHandle) | Out-Null
+        Start-Sleep -Milliseconds 500
+        
+        # Send F11 key
+        [System.Windows.Forms.SendKeys]::SendWait("{F11}")
+        Write-Log "Sent F11 keystroke to restore fullscreen" "INFO"
+        
+        # Wait a moment for the change to take effect
+        Start-Sleep -Milliseconds 1000
+        return $true
+    }
+    catch {
+        Write-Log "Error sending F11 keystroke: $($_.Exception.Message)" "ERROR"
+        return $false
+    }
+}
+
+function Find-EPICWindows {
+    try {
+        # Get all processes that might be EPIC/Citrix related
+        $processes = Get-Process | Where-Object { 
+            $_.ProcessName -like $ProcessFilter -or 
+            $_.MainWindowTitle -like "*EPIC*" -or
+            $_.MainWindowTitle -like "*Hyperspace*" -or
+            $_.ProcessName -like "*receiver*" -or
+            $_.ProcessName -like "*workspace*"
+        }
+        
+        $epicWindows = @()
+        
+        foreach ($process in $processes) {
+            if ($process.MainWindowHandle -ne 0) {
+                $windowTitle = Get-WindowTitle -WindowHandle $process.MainWindowHandle
+                if ($windowTitle -and ($windowTitle -like "*EPIC*" -or $windowTitle -like "*Hyperspace*" -or $windowTitle.Length -gt 10)) {
+                    $epicWindows += @{
+                        Process = $process
+                        WindowHandle = $process.MainWindowHandle
+                        WindowTitle = $windowTitle
+                    }
+                }
+            }
+        }
+        
+        return $epicWindows
+    }
+    catch {
+        Write-Log "Error finding EPIC windows: $($_.Exception.Message)" "ERROR"
+        return @()
+    }
+}
+
+function Start-FullscreenMonitoring {
+    Write-Log "Starting EPIC Fullscreen Monitor..." "INFO"
+    Write-Log "Process Filter: $ProcessFilter" "INFO"
+    Write-Log "Check Interval: $CheckInterval seconds" "INFO"
+    Write-Log "Logging to: $(if($LogToFile) { $LogPath } else { 'Console' })" "INFO"
+    Write-Log "Press Ctrl+C to stop monitoring" "INFO"
+    
+    $consecutiveErrors = 0
+    $maxConsecutiveErrors = 10
+    
+    while ($true) {
+        try {
+            $epicWindows = Find-EPICWindows
+            
+            if ($epicWindows.Count -eq 0) {
+                if ($consecutiveErrors -eq 0) {
+                    Write-Log "No EPIC windows found. Waiting for application to start..." "WARN"
+                }
+                $consecutiveErrors++
+            } else {
+                $consecutiveErrors = 0
+                
+                foreach ($window in $epicWindows) {
+                    $fullscreenStatus = Test-WindowFullscreen -WindowHandle $window.WindowHandle
+                    
+                    Write-Log "Checking window: $($window.WindowTitle)" "INFO"
+                    
+                    if (-not $fullscreenStatus.IsFullscreen) {
+                        Write-Log "Window not in fullscreen mode - attempting to restore" "WARN"
+                        
+                        if (Send-FullscreenToggle -WindowHandle $window.WindowHandle) {
+                            Write-Log "Successfully sent fullscreen toggle to: $($window.WindowTitle)" "INFO"
+                        } else {
+                            Write-Log "Failed to restore fullscreen for: $($window.WindowTitle)" "ERROR"
+                        }
+                    } else {
+                        Write-Log "Window is properly in fullscreen mode" "INFO"
+                    }
+                }
+            }
+            
+            if ($consecutiveErrors -gt $maxConsecutiveErrors) {
+                Write-Log "Too many consecutive errors. Stopping monitor." "ERROR"
+                break
+            }
+            
+            Start-Sleep -Seconds $CheckInterval
+        }
+        catch {
+            Write-Log "Unexpected error in main loop: $($_.Exception.Message)" "ERROR"
+            $consecutiveErrors++
+            Start-Sleep -Seconds $CheckInterval
+        }
+    }
+}
+
+# Handle Ctrl+C gracefully
+$null = Register-EngineEvent PowerShell.Exiting -Action {
+    Write-Log "EPIC Fullscreen Monitor stopped by user" "INFO"
+}
+
+# Start the monitoring
+try {
+    Start-FullscreenMonitoring
+}
+catch {
+    Write-Log "Fatal error: $($_.Exception.Message)" "ERROR"
+    exit 1
+}
